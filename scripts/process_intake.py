@@ -723,7 +723,7 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
             cell.fill = NO_FILL
 
     tmpl_wb._external_links = []
-    tmpl_wb._external_links = []        
+    tmpl_wb.defined_names.clear()
     tmpl_wb.save(output_path)
 
     print(f"Done. Plant: {plant} | Tab: {tab_name} | Rows written: {rows_written}")
