@@ -6,8 +6,8 @@ the correct plant tab of the Spare Parts template.
 
 Usage:
     python process_intake.py \
-        --request <request_file.xlsx> \
-        --template <template_file.xlsx> \
+        --request <request_file.xlsx> \F
+        --template <template_file.xlsx> \F
         --plant <plant_code> \
         --output <output_file.xlsx>
 """
@@ -723,7 +723,6 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
             cell.fill = NO_FILL
 
     tmpl_wb._external_links = []
-    tmpl_wb.defined_names.clear()
     tmpl_wb.save(output_path)
 
     print(f"Done. Plant: {plant} | Tab: {tab_name} | Rows written: {rows_written}")
