@@ -722,6 +722,7 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
         for cell in row:
             cell.fill = NO_FILL
 
+    tmpl_wb._external_links = []
     tmpl_wb.save(output_path)
 
     print(f"Done. Plant: {plant} | Tab: {tab_name} | Rows written: {rows_written}")
