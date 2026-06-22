@@ -391,6 +391,8 @@ SAP_UNIT_OF_LENGTH  = "MARM-MEABM"
 SAP_STD_PRICE       = "MBEW - VERPR"
 SAP_L10_COST        = "MBEW-ZPLP3"
 SAP_L10_COST_DATE   = "MBEW-ZPLD3"
+SAP_EAN             = "MARM-EAN11"     # must stay a plain digit string, never sci notation
+SAP_COUNTRY_ORIGIN  = "MARC-HERKL"     # SAP wants ISO-2 only, request files often have e.g. CN10
 
 # Price table: which L8 column to use per plant
 # Matched by fuzzy keyword in column header (case-insensitive, strip whitespace/\xa0)
@@ -483,6 +485,45 @@ def get_row_value(row: tuple, col_idx: int | None):
     return row[col_idx]
 
 
+def clean_ean(val):
+    """Force EAN/UPC values to a plain digit string, never scientific notation.
+
+    Request files are inconsistent about how EAN/UPC is typed — sometimes
+    text, sometimes a long integer. A 12-13 digit integer stored under a
+    "General" or numeric format gets displayed (and round-tripped through
+    Excel/SAP's bulk upload) as e.g. "1.95526E+11", which SAP then rejects
+    as an invalid EAN. Converting to a plain string here, and forcing the
+    cell to Text format on write, prevents that.
+    """
+    if val is None:
+        return None
+    if isinstance(val, float):
+        return str(int(round(val)))
+    if isinstance(val, int):
+        return str(val)
+    s = str(val).strip()
+    # Defend against a stray scientific-notation string slipping through
+    if re.match(r"^\d(\.\d+)?[eE][+-]?\d+$", s):
+        try:
+            return str(int(float(s)))
+        except ValueError:
+            return s
+    return s
+
+
+def clean_country_code(val):
+    """Take only the ISO-2 prefix from values like CN10, VN20, US30, CA10.
+
+    Request files encode Country of Origin as plant-style codes (letter(s)
+    + digits), but SAP's Country of Origin field (MARC-HERKL) only accepts
+    the 2-letter ISO country code.
+    """
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s[:2].upper() if s else None
+
+
 # ---------------------------------------------------------------------------
 # Price table helpers
 # ---------------------------------------------------------------------------
@@ -558,7 +599,6 @@ def load_price_table(request_path: str, plant: str) -> dict:
         price_map[mat_code] = (std_price, l10_cost)
 
     return price_map
-
 
 
 # ---------------------------------------------------------------------------
@@ -713,6 +753,13 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
     sap_uol_n    = normalize_sap(SAP_UNIT_OF_LENGTH)
     sap_wt_n     = normalize_sap(SAP_WT_UNIT)
     sap_vol_n    = normalize_sap(SAP_VOLUME)
+    sap_ean_n    = normalize_sap(SAP_EAN)
+    sap_herkl_n  = normalize_sap(SAP_COUNTRY_ORIGIN)
+
+    # Template column index for EAN (0-based), used to force Text format below
+    ean_tmpl_col = next(
+        (idx for idx, code in tmpl_col_to_sap.items() if code == sap_ean_n), None
+    )
 
     # --- Write data rows ---
     rows_written = 0
@@ -777,6 +824,14 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
             # 7. Apply dimension/weight conversion if needed
             val = convert_value(sap, val, convert_units)
 
+            # 8. EAN/UPC must stay a plain digit string (never scientific notation)
+            if sap == sap_ean_n:
+                val = clean_ean(val)
+
+            # 9. Country of Origin: SAP wants ISO-2 only (request has e.g. CN10)
+            if sap == sap_herkl_n:
+                val = clean_country_code(val)
+
             if val is None and req_col is None:
                 blanks_log.append(sap)
 
@@ -792,6 +847,11 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
         # Strip fill color from the newly appended row
         for cell in tmpl_ws[tmpl_ws.max_row]:
             cell.fill = NO_FILL
+
+        # Force the EAN column to Text format so Excel never displays it
+        # as scientific notation (e.g. 1.95526E+11), which SAP rejects
+        if ean_tmpl_col is not None:
+            tmpl_ws.cell(row=tmpl_ws.max_row, column=ean_tmpl_col + 1).number_format = "@"
 
         rows_written += 1
 
