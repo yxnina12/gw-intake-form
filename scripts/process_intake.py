@@ -13,8 +13,10 @@ Usage:
 """
 
 import argparse
+import io
 import re
 import shutil
+import zipfile
 from datetime import date
 from pathlib import Path
 
@@ -558,6 +560,67 @@ def load_price_table(request_path: str, plant: str) -> dict:
     return price_map
 
 
+
+# ---------------------------------------------------------------------------
+# Post-save cleanup: remove stale named ranges & external links from xlsx
+# ---------------------------------------------------------------------------
+
+def _clean_xlsx(path: str) -> None:
+    """Strip external links and broken/stale named ranges from the saved xlsx.
+
+    The original template carries legacy named ranges and external workbook
+    links (visible as #REF! errors and hidden helper names like _Goi8,
+    _Key1, _Fill when inspected). These survive the copy/sheet-deletion
+    process and corrupt the output enough that Excel shows a repair warning
+    and SAP's OLE-based upload (UPLOAD_OLE) can fail outright. xlsx files are
+    zip archives, so we rewrite the zip: drop the externalLink parts, and
+    strip <externalReferences> and all <definedName> entries from
+    workbook.xml so nothing dangling is left for Excel/SAP to choke on.
+    """
+    data = Path(path).read_bytes()
+    buf_out = io.BytesIO()
+
+    with zipfile.ZipFile(io.BytesIO(data), "r") as zin, \
+         zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+
+        for name in zin.namelist():
+            # Drop all externalLink parts (xl/externalLinks/externalLink*.xml + rels)
+            if re.search(r"externalLink", name, re.I):
+                continue
+
+            raw = zin.read(name)
+
+            if name == "xl/workbook.xml":
+                text = raw.decode("utf-8")
+                text = re.sub(
+                    r"<externalReferences\b[^>]*>.*?</externalReferences>",
+                    "", text, flags=re.S
+                )
+                text = re.sub(
+                    r"<definedName\b[^>]*>.*?</definedName>",
+                    "", text, flags=re.S
+                )
+                text = re.sub(r"<definedNames\s*/>", "", text)
+                text = re.sub(r"<definedNames>\s*</definedNames>", "", text)
+                raw = text.encode("utf-8")
+
+            elif name == "xl/_rels/workbook.xml.rels":
+                text = raw.decode("utf-8")
+                text = re.sub(
+                    r'<Relationship\b[^>]*externalLink[^/]*/>', "", text, flags=re.I
+                )
+                raw = text.encode("utf-8")
+
+            elif name == "xl/calcChain.xml":
+                # calcChain can reference cells/sheets that no longer match; drop it,
+                # Excel rebuilds it automatically on open
+                continue
+
+            zout.writestr(name, raw)
+
+    Path(path).write_bytes(buf_out.getvalue())
+
+
 # ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
@@ -741,6 +804,10 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
             cell.fill = NO_FILL
 
     tmpl_wb.save(output_path)
+
+    # Remove broken named ranges and external links (prevents Excel repair
+    # warnings and SAP UPLOAD_OLE failures on import)
+    _clean_xlsx(output_path)
 
     print(f"Done. Plant: {plant} | Tab: {tab_name} | Rows written: {rows_written}")
     if blanks_log:
