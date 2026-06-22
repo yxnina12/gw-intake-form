@@ -6,8 +6,8 @@ the correct plant tab of the Spare Parts template.
 
 Usage:
     python process_intake.py \
-        --request <request_file.xlsx> \F
-        --template <template_file.xlsx> \F
+        --request <request_file.xlsx> \
+        --template <template_file.xlsx> \
         --plant <plant_code> \
         --output <output_file.xlsx>
 """
@@ -425,6 +425,24 @@ def normalize_sap(code: str) -> str:
     return re.sub(r"\s+", " ", str(code).strip())
 
 
+def find_sheet(wb, target_name: str):
+    """Find a worksheet by name, tolerant of case and extra whitespace.
+
+    Request files sometimes have the "Intake form" tab renamed with different
+    capitalization (e.g. "Intake Form", "intake form"). An exact-match lookup
+    breaks on any of these variants, so we normalize both sides before
+    comparing.
+    """
+    target_norm = re.sub(r"\s+", " ", target_name.strip()).lower()
+    for name in wb.sheetnames:
+        if re.sub(r"\s+", " ", name.strip()).lower() == target_norm:
+            return wb[name]
+    raise KeyError(
+        f"Worksheet matching '{target_name}' not found. "
+        f"Available sheets: {wb.sheetnames}"
+    )
+
+
 def build_sap_map(ws, sap_row: int = 3) -> dict:
     """Return {normalized_sap_code: 0-based_col_index} using FIRST occurrence.
 
@@ -581,7 +599,7 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
 
     # --- Load request file ---
     req_wb = load_workbook(request_path, data_only=True)
-    req_ws = req_wb["Intake form"]
+    req_ws = find_sheet(req_wb, "Intake form")
     req_sap_map = build_sap_map(req_ws, sap_row=3)
 
     # Column index for unit-of-length filtering in request
@@ -722,7 +740,6 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
         for cell in row:
             cell.fill = NO_FILL
 
-    tmpl_wb._external_links = []
     tmpl_wb.save(output_path)
 
     print(f"Done. Plant: {plant} | Tab: {tab_name} | Rows written: {rows_written}")
