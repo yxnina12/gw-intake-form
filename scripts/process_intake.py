@@ -13,10 +13,8 @@ Usage:
 """
 
 import argparse
-import io
 import re
 import shutil
-import zipfile
 from datetime import date
 from pathlib import Path
 
@@ -96,7 +94,7 @@ PLANT_CONFIG = {
     },
     "CA10": {
         "tab": "CA10",
-        "unit_of_length": '"',
+        "unit_of_length": "CM",
         "fixed_by_col": {
             107: "X",   # ML activity (col 108, no SAP code)
         },
@@ -391,8 +389,6 @@ SAP_UNIT_OF_LENGTH  = "MARM-MEABM"
 SAP_STD_PRICE       = "MBEW - VERPR"
 SAP_L10_COST        = "MBEW-ZPLP3"
 SAP_L10_COST_DATE   = "MBEW-ZPLD3"
-SAP_EAN             = "MARM-EAN11"     # must stay a plain digit string, never sci notation
-SAP_COUNTRY_ORIGIN  = "MARC-HERKL"     # SAP wants ISO-2 only, request files often have e.g. CN10
 
 # Price table: which L8 column to use per plant
 # Matched by fuzzy keyword in column header (case-insensitive, strip whitespace/\xa0)
@@ -427,24 +423,6 @@ def normalize_sap(code: str) -> str:
     if not code:
         return ""
     return re.sub(r"\s+", " ", str(code).strip())
-
-
-def find_sheet(wb, target_name: str):
-    """Find a worksheet by name, tolerant of case and extra whitespace.
-
-    Request files sometimes have the "Intake form" tab renamed with different
-    capitalization (e.g. "Intake Form", "intake form"). An exact-match lookup
-    breaks on any of these variants, so we normalize both sides before
-    comparing.
-    """
-    target_norm = re.sub(r"\s+", " ", target_name.strip()).lower()
-    for name in wb.sheetnames:
-        if re.sub(r"\s+", " ", name.strip()).lower() == target_norm:
-            return wb[name]
-    raise KeyError(
-        f"Worksheet matching '{target_name}' not found. "
-        f"Available sheets: {wb.sheetnames}"
-    )
 
 
 def build_sap_map(ws, sap_row: int = 3) -> dict:
@@ -483,45 +461,6 @@ def get_row_value(row: tuple, col_idx: int | None):
     if col_idx is None or col_idx >= len(row):
         return None
     return row[col_idx]
-
-
-def clean_ean(val):
-    """Force EAN/UPC values to a plain digit string, never scientific notation.
-
-    Request files are inconsistent about how EAN/UPC is typed — sometimes
-    text, sometimes a long integer. A 12-13 digit integer stored under a
-    "General" or numeric format gets displayed (and round-tripped through
-    Excel/SAP's bulk upload) as e.g. "1.95526E+11", which SAP then rejects
-    as an invalid EAN. Converting to a plain string here, and forcing the
-    cell to Text format on write, prevents that.
-    """
-    if val is None:
-        return None
-    if isinstance(val, float):
-        return str(int(round(val)))
-    if isinstance(val, int):
-        return str(val)
-    s = str(val).strip()
-    # Defend against a stray scientific-notation string slipping through
-    if re.match(r"^\d(\.\d+)?[eE][+-]?\d+$", s):
-        try:
-            return str(int(float(s)))
-        except ValueError:
-            return s
-    return s
-
-
-def clean_country_code(val):
-    """Take only the ISO-2 prefix from values like CN10, VN20, US30, CA10.
-
-    Request files encode Country of Origin as plant-style codes (letter(s)
-    + digits), but SAP's Country of Origin field (MARC-HERKL) only accepts
-    the 2-letter ISO country code.
-    """
-    if val is None:
-        return None
-    s = str(val).strip()
-    return s[:2].upper() if s else None
 
 
 # ---------------------------------------------------------------------------
@@ -602,82 +541,27 @@ def load_price_table(request_path: str, plant: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Post-save cleanup: remove stale named ranges & external links from xlsx
-# ---------------------------------------------------------------------------
-
-def _clean_xlsx(path: str) -> None:
-    """Strip external links and broken/stale named ranges from the saved xlsx.
-
-    The original template carries legacy named ranges and external workbook
-    links (visible as #REF! errors and hidden helper names like _Goi8,
-    _Key1, _Fill when inspected). These survive the copy/sheet-deletion
-    process and corrupt the output enough that Excel shows a repair warning
-    and SAP's OLE-based upload (UPLOAD_OLE) can fail outright. xlsx files are
-    zip archives, so we rewrite the zip: drop the externalLink parts, and
-    strip <externalReferences> and all <definedName> entries from
-    workbook.xml so nothing dangling is left for Excel/SAP to choke on.
-    """
-    data = Path(path).read_bytes()
-    buf_out = io.BytesIO()
-
-    with zipfile.ZipFile(io.BytesIO(data), "r") as zin, \
-         zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
-
-        for name in zin.namelist():
-            # Drop all externalLink parts (xl/externalLinks/externalLink*.xml + rels)
-            if re.search(r"externalLink", name, re.I):
-                continue
-
-            raw = zin.read(name)
-
-            if name == "xl/workbook.xml":
-                text = raw.decode("utf-8")
-                text = re.sub(
-                    r"<externalReferences\b[^>]*>.*?</externalReferences>",
-                    "", text, flags=re.S
-                )
-                text = re.sub(
-                    r"<definedName\b[^>]*>.*?</definedName>",
-                    "", text, flags=re.S
-                )
-                text = re.sub(r"<definedNames\s*/>", "", text)
-                text = re.sub(r"<definedNames>\s*</definedNames>", "", text)
-                raw = text.encode("utf-8")
-
-            elif name == "xl/_rels/workbook.xml.rels":
-                text = raw.decode("utf-8")
-                text = re.sub(
-                    r'<Relationship\b[^>]*externalLink[^/]*/>', "", text, flags=re.I
-                )
-                raw = text.encode("utf-8")
-
-            elif name == "xl/calcChain.xml":
-                # calcChain can reference cells/sheets that no longer match; drop it,
-                # Excel rebuilds it automatically on open
-                continue
-
-            zout.writestr(name, raw)
-
-    Path(path).write_bytes(buf_out.getvalue())
-
-
-# ---------------------------------------------------------------------------
 # Main processing
 # ---------------------------------------------------------------------------
 
-def convert_value(sap: str, val, convert_units: bool):
-    """Apply imperial→metric conversion for dimension/weight fields if needed."""
-    if not convert_units or val is None:
+def convert_value(sap: str, val, direction: str | None):
+    """Apply unit conversion for dimension/weight fields if needed.
+
+    direction: "to_metric" (inch->cm, lb->kg), "to_imperial" (cm->inch, kg->lb), or None.
+    """
+    if direction is None or val is None:
         return val
     sap_n = normalize_sap(sap)
     if sap_n in (normalize_sap(SAP_LENGTH), normalize_sap(SAP_WIDTH), normalize_sap(SAP_HEIGHT)):
         try:
-            return round(float(val) * INCH_TO_CM, 2)
+            factor = INCH_TO_CM if direction == "to_metric" else (1 / INCH_TO_CM)
+            return round(float(val) * factor, 2)
         except (ValueError, TypeError):
             return val
     if sap_n in (normalize_sap(SAP_GROSS_WT), normalize_sap(SAP_NET_WT)):
         try:
-            return round(float(val) * LB_TO_KG, 2)
+            factor = LB_TO_KG if direction == "to_metric" else (1 / LB_TO_KG)
+            return round(float(val) * factor, 2)
         except (ValueError, TypeError):
             return val
     return val
@@ -702,15 +586,18 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
 
     # --- Load request file ---
     req_wb = load_workbook(request_path, data_only=True)
-    req_ws = find_sheet(req_wb, "Intake form")
+    req_ws = req_wb["Intake form"]
     req_sap_map = build_sap_map(req_ws, sap_row=3)
 
     # Column index for unit-of-length filtering in request
     uol_col = req_sap_map.get(normalize_sap(SAP_UNIT_OF_LENGTH))
 
-    # When converting: always take imperial rows (inch symbol)
+    # When converting: take rows in the unit OPPOSITE the target's native unit
     # When not converting: take rows matching the plant's native unit
-    filter_unit = '"' if convert_units else config["unit_of_length"]
+    target_unit = config["unit_of_length"]
+    opposite_unit = "CM" if target_unit == '"' else '"'
+    filter_unit = opposite_unit if convert_units else target_unit
+    convert_direction = ("to_metric" if target_unit == "CM" else "to_imperial") if convert_units else None
 
     # Collect data rows (row 10 onwards)
     all_req_rows = list(req_ws.iter_rows(min_row=10, values_only=True))
@@ -753,13 +640,6 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
     sap_uol_n    = normalize_sap(SAP_UNIT_OF_LENGTH)
     sap_wt_n     = normalize_sap(SAP_WT_UNIT)
     sap_vol_n    = normalize_sap(SAP_VOLUME)
-    sap_ean_n    = normalize_sap(SAP_EAN)
-    sap_herkl_n  = normalize_sap(SAP_COUNTRY_ORIGIN)
-
-    # Template column index for EAN (0-based), used to force Text format below
-    ean_tmpl_col = next(
-        (idx for idx, code in tmpl_col_to_sap.items() if code == sap_ean_n), None
-    )
 
     # --- Write data rows ---
     rows_written = 0
@@ -808,10 +688,10 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
             # 5. Unit conversion overrides (when --convert is set)
             if convert_units:
                 if sap == sap_uol_n:
-                    out_row[tmpl_col_idx] = "CM"
+                    out_row[tmpl_col_idx] = "CM" if convert_direction == "to_metric" else '"'
                     continue
                 if sap == sap_wt_n:
-                    out_row[tmpl_col_idx] = "KG"
+                    out_row[tmpl_col_idx] = "KG" if convert_direction == "to_metric" else "LB"
                     continue
                 if sap == sap_vol_n:
                     out_row[tmpl_col_idx] = None   # leave volume blank
@@ -822,15 +702,7 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
             val = get_row_value(req_row, req_col)
 
             # 7. Apply dimension/weight conversion if needed
-            val = convert_value(sap, val, convert_units)
-
-            # 8. EAN/UPC must stay a plain digit string (never scientific notation)
-            if sap == sap_ean_n:
-                val = clean_ean(val)
-
-            # 9. Country of Origin: SAP wants ISO-2 only (request has e.g. CN10)
-            if sap == sap_herkl_n:
-                val = clean_country_code(val)
+            val = convert_value(sap, val, convert_direction)
 
             if val is None and req_col is None:
                 blanks_log.append(sap)
@@ -848,11 +720,6 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
         for cell in tmpl_ws[tmpl_ws.max_row]:
             cell.fill = NO_FILL
 
-        # Force the EAN column to Text format so Excel never displays it
-        # as scientific notation (e.g. 1.95526E+11), which SAP rejects
-        if ean_tmpl_col is not None:
-            tmpl_ws.cell(row=tmpl_ws.max_row, column=ean_tmpl_col + 1).number_format = "@"
-
         rows_written += 1
 
     # Clear all conditional formatting (template CF rules can override cell.fill = NO_FILL)
@@ -864,10 +731,6 @@ def process(request_path: str, template_path: str, plant: str, output_path: str,
             cell.fill = NO_FILL
 
     tmpl_wb.save(output_path)
-
-    # Remove broken named ranges and external links (prevents Excel repair
-    # warnings and SAP UPLOAD_OLE failures on import)
-    _clean_xlsx(output_path)
 
     print(f"Done. Plant: {plant} | Tab: {tab_name} | Rows written: {rows_written}")
     if blanks_log:
