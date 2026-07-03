@@ -25,15 +25,10 @@ PLANT_LABELS = {
     "UK11": "UK11 — United Kingdom",
 }
 
-# Imperial source plants (unit_of_length == '"')
-IMPERIAL_PLANTS = {p for p, cfg in PLANT_CONFIG.items() if cfg["unit_of_length"] == '"'}
-# Plants that need metric output — CA10 reads imperial rows but outputs CM/KG
-METRIC_PLANTS = {p for p, cfg in PLANT_CONFIG.items() if cfg["unit_of_length"] == "CM"} | {"CA10"}
-
 
 def needs_conversion(source_plant: str, target_plant: str) -> bool:
-    """True when source is imperial and target expects metric."""
-    return source_plant in IMPERIAL_PLANTS and target_plant in METRIC_PLANTS
+    """True whenever source and target use different unit systems."""
+    return PLANT_CONFIG[source_plant]["unit_of_length"] != PLANT_CONFIG[target_plant]["unit_of_length"]
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -95,7 +90,7 @@ if target_plants:
     if no_convert_targets:
         info_parts.append(f"**{', '.join(no_convert_targets)}** — no unit conversion")
     if convert_targets:
-        info_parts.append(f"**{', '.join(convert_targets)}** — imperial → metric conversion")
+        info_parts.append(f"**{', '.join(convert_targets)}** — unit conversion")
 
     st.info("Auto-detected: " + " · ".join(info_parts))
 
