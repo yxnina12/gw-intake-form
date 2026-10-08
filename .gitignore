@@ -1,0 +1,9 @@
+# never commit request files or generated outputs
+*.xlsx
+# ...except the blank template, wherever it sits
+!Material Intake Form-Spare Parts.xlsx
+!templates/*.xlsx
+__pycache__/
+*.pyc
+.DS_Store
+.streamlit/secrets.toml
