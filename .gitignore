@@ -1,7 +1,0 @@
-# never commit request files or generated outputs
-*.xlsx
-!templates/*.xlsx
-__pycache__/
-*.pyc
-.DS_Store
-.streamlit/secrets.toml
