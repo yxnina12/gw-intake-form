@@ -172,22 +172,27 @@ st.subheader("3 · Plants")
 cols = st.columns(len(G.PLANT_ORDER))
 chosen = []
 for i, p in enumerate(G.PLANT_ORDER):
-    default = False
-    label = p
-    if p in G.EU_DEFAULT:
-        label = f"{p} ·EU"
-    if cols[i].checkbox(label, value=default, key=f"plant_{p}"):
+    label = f"{p} ·EU" if p in G.EU_DEFAULT else p
+    # No `value=` here on purpose: session_state (set by the quick-select
+    # callbacks) is the single source of truth, and passing both logs a
+    # "created with a default value but also had its value set" warning.
+    if cols[i].checkbox(label, key=f"plant_{p}"):
         chosen.append(p)
 
+# Must be on_click callbacks: a callback runs BEFORE the script re-executes,
+# so the checkbox widgets do not exist yet and writing their session_state keys
+# is legal. Setting them inline after the checkboxes are drawn raises
+# StreamlitWidgetAlreadyInstantiatedError on Streamlit >= 1.6x (seen 2026-10-15).
+def _set_plants(targets):
+    for q in G.PLANT_ORDER:
+        st.session_state[f"plant_{q}"] = q in targets
+
+
 bq1, bq2 = st.columns([1, 6])
-if bq1.button("EU default (3)"):
-    for p in G.PLANT_ORDER:
-        st.session_state[f"plant_{p}"] = p in G.EU_DEFAULT
-    st.rerun()
-if bq2.button("US + CA"):
-    for p in G.PLANT_ORDER:
-        st.session_state[f"plant_{p}"] = p in ("US30", "CA10")
-    st.rerun()
+bq1.button("EU default (3)", on_click=_set_plants,
+           args=(set(G.EU_DEFAULT),), key="btn_eu")
+bq2.button("US + CA", on_click=_set_plants,
+           args=({"US30", "CA10"},), key="btn_usca")
 
 if not chosen:
     st.info("Pick at least one plant.")
