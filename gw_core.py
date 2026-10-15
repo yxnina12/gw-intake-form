@@ -243,15 +243,48 @@ def detect_format(file_bytes: bytes) -> str:
     return "bulk" if SAP_MATNR in codes else "flat"
 
 
-def read_bulk_source(file_bytes: bytes):
-    """Bulk 'Intake form' layout: SAP codes in row 3, data from row 10."""
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+def peek_source(file_bytes: bytes) -> dict:
+    """Cheap probe: layout, sheet name and row extent WITHOUT parsing rows.
+
+    Lets the UI ask for a row window up front so a 5,000-row request file is
+    never fully parsed when the user only wants the last few rows.
+    """
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+    first = wb[wb.sheetnames[0]]
+    row3 = list(first.iter_rows(min_row=3, max_row=3, values_only=True))
+    codes = [normalize_sap(c) for c in (row3[0] if row3 else []) if c]
+    fmt = "bulk" if SAP_MATNR in codes else "flat"
+    if fmt == "bulk":
+        ws = wb["Intake form"] if "Intake form" in wb.sheetnames else first
+        first_data_row = 10
+    else:
+        ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else first
+        first_data_row = 2
+    last_row = ws.max_row or first_data_row
+    title = ws.title
+    wb.close()
+    return {"fmt": fmt, "sheet_name": title,
+            "first_data_row": first_data_row,
+            "last_row": max(last_row, first_data_row)}
+
+
+def read_bulk_source(file_bytes: bytes, start: int = 10, end: int | None = None):
+    """Bulk 'Intake form' layout: SAP codes in row 3, data from row 10.
+
+    `start`/`end` bound the scan to the Excel rows actually wanted, so a huge
+    request file costs the same as a small one.
+    """
+    # read_only + iter_rows: per-cell ws.cell() on a normal worksheet is ~100x
+    # slower and made a real 4,800-row request file take 76s to parse, which
+    # looked like the app had hung (confirmed 2026-10-15).
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
     ws = wb["Intake form"] if "Intake form" in wb.sheetnames else wb[wb.sheetnames[0]]
     sap_map = build_sap_map(ws, 3)
     col_to_sap = {v: k for k, v in sap_map.items()}
     rows = []
-    for r in range(10, ws.max_row + 1):
-        values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+    start = max(10, int(start))
+    for r, values in enumerate(
+            ws.iter_rows(min_row=start, max_row=end, values_only=True), start=start):
         if not any(v is not None and str(v).strip() != "" for v in values):
             continue
         d = {}
@@ -262,18 +295,19 @@ def read_bulk_source(file_bytes: bytes):
         d["_row"] = r
         d["_date"] = values[0] if values else None
         rows.append(d)
-    return ws.title, rows
+    title = ws.title
+    wb.close()
+    return title, rows
 
 
 def read_flat_source(file_bytes: bytes):
     """Flat layout: plain headers in row 1, data from row 2."""
-    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
     ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb[wb.sheetnames[0]]
     headers = list(ws.iter_rows(min_row=1, max_row=1, values_only=True))[0]
     col_idx = {h: i for i, h in enumerate(headers) if h}
     rows = []
-    for r in range(2, ws.max_row + 1):
-        values = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+    for r, values in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         if not any(v is not None and str(v).strip() != "" for v in values):
             continue
         d = {}
@@ -283,7 +317,9 @@ def read_flat_source(file_bytes: bytes):
         d["_row"] = r
         d["_date"] = None
         rows.append(d)
-    return ws.title, rows
+    title = ws.title
+    wb.close()
+    return title, rows
 
 
 # ---------------------------------------------------------------------------

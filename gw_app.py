@@ -70,27 +70,70 @@ if not up:
             "and the flat **Sheet1** extend layout (plain headers in row 1).")
     st.stop()
 
+# Everything below is cached on the file bytes (plus the row window). Without
+# this, every widget click re-parsed the whole workbook and the app looked
+# frozen; and the window keeps a 5,000-row request file as cheap as a small one
+# when only the last few rows are wanted (both confirmed 2026-10-15).
+@st.cache_data(show_spinner=False, max_entries=5)
+def peek(file_bytes: bytes):
+    return G.peek_source(file_bytes)
+
+
+@st.cache_data(show_spinner="Reading those rows...", max_entries=5)
+def parse_source(file_bytes: bytes, start: int | None, end: int | None):
+    info = G.peek_source(file_bytes)
+    if info["fmt"] == "bulk":
+        sheet_name, rows = G.read_bulk_source(file_bytes, start or 10, end)
+    else:
+        sheet_name, rows = G.read_flat_source(file_bytes)
+    return info["fmt"], sheet_name, rows
+
+
 src_bytes = up.getvalue()
 try:
-    fmt = G.detect_format(src_bytes)
-    if fmt == "bulk":
-        sheet_name, all_rows = G.read_bulk_source(src_bytes)
-    else:
-        sheet_name, all_rows = G.read_flat_source(src_bytes)
+    info = peek(src_bytes)
+except Exception as e:  # noqa: BLE001
+    st.error(f"Could not read that file: {e}")
+    st.stop()
+
+fmt = info["fmt"]
+
+# ---------------------------------------------------------------- step 2
+st.subheader("2 · Rows to process")
+
+if fmt == "bulk":
+    lo, hi = info["first_data_row"], info["last_row"]
+    st.caption(f"Bulk **{info['sheet_name']}** layout · the sheet runs to row "
+               f"**{hi}**. Narrow this to the rows you actually need and only "
+               "those are read — a 5,000-row file then costs the same as a "
+               "small one. These are the real Excel row numbers, so you can "
+               "type them straight off the request e-mail.")
+    c1, c2 = st.columns(2)
+    start = int(c1.number_input("From Excel row", min_value=lo, max_value=hi,
+                                value=lo, key="row_from"))
+    end = int(c2.number_input("To Excel row", min_value=lo, max_value=hi,
+                              value=hi, key="row_to"))
+    if end < start:
+        st.error("'To' row is before 'From' row.")
+        st.stop()
+else:
+    start, end = None, None
+    st.caption("Flat extend file — small, so every row is read.")
+
+try:
+    fmt, sheet_name, all_rows = parse_source(src_bytes, start, end)
 except Exception as e:  # noqa: BLE001
     st.error(f"Could not read that file: {e}")
     st.stop()
 
 if not all_rows:
-    st.error("No data rows found in that file.")
+    st.error(f"No data rows between {start} and {end}. The sheet claims to run "
+             f"to row {info['last_row']}, but trailing rows are often empty "
+             "formatting — try a lower 'To' row, or check the row numbers in "
+             "the request e-mail.")
     st.stop()
 
-st.success(f"Detected **{fmt}** layout · sheet `{sheet_name}` · "
-           f"{len(all_rows)} data rows")
-
-# ---------------------------------------------------------------- step 2
-st.subheader("2 · Rows to process")
-
+selected = all_rows
 
 def row_label(r):
     d = r.get("_date")
@@ -110,30 +153,7 @@ preview = pd.DataFrame([{
     "Unit": f'{G.clean_str(r.get(G.SAP_LEN_UNIT))} / {G.clean_str(r.get(G.SAP_WT_UNIT))}',
 } for r in all_rows])
 
-if fmt == "bulk":
-    lo, hi = all_rows[0]["_row"], all_rows[-1]["_row"]
-    c1, c2, c3 = st.columns([1, 1, 2])
-    start = c1.number_input("From Excel row", min_value=lo, max_value=hi,
-                            value=max(lo, hi - 9))
-    end = c2.number_input("To Excel row", min_value=lo, max_value=hi, value=hi)
-    c3.caption(f"The file's data rows run from {lo} to {hi}. "
-               "Row numbers are the real Excel row numbers, so you can read "
-               "them straight off the request e-mail.")
-    if end < start:
-        st.error("'To' row is before 'From' row.")
-        st.stop()
-    selected = [r for r in all_rows if start <= r["_row"] <= end]
-    st.dataframe(preview[(preview["Excel row"] >= start) &
-                         (preview["Excel row"] <= end)],
-                 use_container_width=True, hide_index=True)
-else:
-    st.caption("Flat extend files are small — all rows are processed.")
-    selected = all_rows
-    st.dataframe(preview, use_container_width=True, hide_index=True)
-
-if not selected:
-    st.error("No rows in that range.")
-    st.stop()
+st.dataframe(preview, use_container_width=True, hide_index=True)
 
 # duplicate material codes
 codes = [G.clean_str(r.get(G.SAP_MATNR)) for r in selected]
