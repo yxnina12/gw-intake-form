@@ -60,26 +60,32 @@ with st.sidebar:
 st.title("GW Material Intake Form — Spare Parts")
 
 # ---------------------------------------------------------------- step 1
-st.subheader("1 · Source file")
-up = st.file_uploader("Upload the request file (.xlsx)", type=["xlsx"],
-                      key="src_upload")
+st.subheader("1 · Source files")
+ups = st.file_uploader(
+    "Upload the request file(s) (.xlsx)", type=["xlsx"],
+    accept_multiple_files=True, key="src_upload",
+    help="You can upload more than one. Rows from every file are merged into "
+         "the same output sheet per plant.")
 
-if not up:
+if not ups:
     st.info("Upload a request file to start. Both layouts are supported: the "
             "bulk **Intake form** sheet (SAP codes in row 3, data from row 10) "
-            "and the flat **Sheet1** extend layout (plain headers in row 1).")
+            "and the flat **Sheet1** extend layout (plain headers in row 1). "
+            "Several files can be uploaded at once — their rows end up in one "
+            "sheet per plant.")
     st.stop()
+
 
 # Everything below is cached on the file bytes (plus the row window). Without
 # this, every widget click re-parsed the whole workbook and the app looked
 # frozen; and the window keeps a 5,000-row request file as cheap as a small one
 # when only the last few rows are wanted (both confirmed 2026-10-15).
-@st.cache_data(show_spinner=False, max_entries=5)
+@st.cache_data(show_spinner=False, max_entries=10)
 def peek(file_bytes: bytes):
     return G.peek_source(file_bytes)
 
 
-@st.cache_data(show_spinner="Reading those rows...", max_entries=5)
+@st.cache_data(show_spinner="Reading those rows...", max_entries=10)
 def parse_source(file_bytes: bytes, start: int | None, end: int | None):
     info = G.peek_source(file_bytes)
     if info["fmt"] == "bulk":
@@ -89,51 +95,64 @@ def parse_source(file_bytes: bytes, start: int | None, end: int | None):
     return info["fmt"], sheet_name, rows
 
 
-src_bytes = up.getvalue()
-try:
-    info = peek(src_bytes)
-except Exception as e:  # noqa: BLE001
-    st.error(f"Could not read that file: {e}")
-    st.stop()
-
-fmt = info["fmt"]
-
 # ---------------------------------------------------------------- step 2
 st.subheader("2 · Rows to process")
 
-if fmt == "bulk":
-    lo, hi = info["first_data_row"], info["last_row"]
-    st.caption(f"Bulk **{info['sheet_name']}** layout · the sheet runs to row "
-               f"**{hi}**. Narrow this to the rows you actually need and only "
-               "those are read — a 5,000-row file then costs the same as a "
-               "small one. These are the real Excel row numbers, so you can "
-               "type them straight off the request e-mail.")
-    c1, c2 = st.columns(2)
-    start = int(c1.number_input("From Excel row", min_value=lo, max_value=hi,
-                                value=lo, key="row_from"))
-    end = int(c2.number_input("To Excel row", min_value=lo, max_value=hi,
-                              value=hi, key="row_to"))
-    if end < start:
-        st.error("'To' row is before 'From' row.")
+selected = []
+for n, up in enumerate(ups):
+    src_bytes = up.getvalue()
+    try:
+        info = peek(src_bytes)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"**{up.name}** — could not read that file: {e}")
         st.stop()
-else:
-    start, end = None, None
-    st.caption("Flat extend file — small, so every row is read.")
 
-try:
-    fmt, sheet_name, all_rows = parse_source(src_bytes, start, end)
-except Exception as e:  # noqa: BLE001
-    st.error(f"Could not read that file: {e}")
+    with st.container(border=True):
+        st.markdown(f"**{up.name}** · `{info['fmt']}` layout · "
+                    f"sheet `{info['sheet_name']}`")
+        if info["fmt"] == "bulk":
+            lo, hi = info["first_data_row"], info["last_row"]
+            st.caption(f"The sheet runs to row **{hi}**. Narrow this to the "
+                       "rows you actually need — only those are read. These "
+                       "are the real Excel row numbers, so you can type them "
+                       "straight off the request e-mail.")
+            c1, c2 = st.columns(2)
+            start = int(c1.number_input("From Excel row", min_value=lo,
+                                        max_value=hi, value=lo,
+                                        key=f"row_from_{n}"))
+            end = int(c2.number_input("To Excel row", min_value=lo,
+                                      max_value=hi, value=hi,
+                                      key=f"row_to_{n}"))
+            if end < start:
+                st.error("'To' row is before 'From' row.")
+                st.stop()
+        else:
+            start, end = None, None
+            st.caption("Flat extend file — small, so every row is read.")
+
+        try:
+            _fmt, _sheet, rows = parse_source(src_bytes, start, end)
+        except Exception as e:  # noqa: BLE001
+            st.error(f"**{up.name}** — could not read that file: {e}")
+            st.stop()
+
+        if not rows:
+            st.error(f"No data rows between {start} and {end}. The sheet "
+                     f"claims to run to row {info['last_row']}, but trailing "
+                     "rows are often empty formatting — try a lower 'To' row.")
+            st.stop()
+
+        st.caption(f"{len(rows)} row(s) from this file.")
+
+    for r in rows:
+        r = dict(r)
+        r["_src"] = up.name
+        selected.append(r)
+
+if not selected:
+    st.error("No rows selected.")
     st.stop()
 
-if not all_rows:
-    st.error(f"No data rows between {start} and {end}. The sheet claims to run "
-             f"to row {info['last_row']}, but trailing rows are often empty "
-             "formatting — try a lower 'To' row, or check the row numbers in "
-             "the request e-mail.")
-    st.stop()
-
-selected = all_rows
 
 def row_label(r):
     d = r.get("_date")
@@ -144,28 +163,35 @@ def row_label(r):
     return d
 
 
+multi = len(ups) > 1
 preview = pd.DataFrame([{
+    **({"Source file": r["_src"]} if multi else {}),
     "Excel row": r["_row"],
     "Date": row_label(r),
     "Material": G.clean_str(r.get(G.SAP_MATNR)),
     "Description": G.clean_str(r.get(G.SAP_DESC)),
     "Plant (source text)": G.clean_str(r.get(G.SAP_PLANT)),
     "Unit": f'{G.clean_str(r.get(G.SAP_LEN_UNIT))} / {G.clean_str(r.get(G.SAP_WT_UNIT))}',
-} for r in all_rows])
+} for r in selected])
 
 st.dataframe(preview, use_container_width=True, hide_index=True)
 
-# duplicate material codes
+# duplicate material codes (kept, not dropped — user's call, confirmed 2026-10-15)
 codes = [G.clean_str(r.get(G.SAP_MATNR)) for r in selected]
 dupes = sorted({c for c in codes if c and codes.count(c) > 1})
 if dupes:
-    st.warning(f"Duplicate material codes in the selection: {', '.join(dupes)} "
-               "— check the source file before generating.")
-blank_codes = [r["_row"] for r in selected if not G.clean_str(r.get(G.SAP_MATNR))]
+    where = {c: [f"{r['_src']} row {r['_row']}" for r in selected
+                 if G.clean_str(r.get(G.SAP_MATNR)) == c] for c in dupes}
+    st.warning("Duplicate material code(s) — **both rows are kept**, check "
+               "before generating: " +
+               "; ".join(f"**{c}** ({', '.join(v)})" for c, v in where.items()))
+blank_codes = [f"{r['_src']} row {r['_row']}" for r in selected
+               if not G.clean_str(r.get(G.SAP_MATNR))]
 if blank_codes:
-    st.warning(f"Rows with no material code: {blank_codes}")
+    st.warning(f"Rows with no material code: {', '.join(blank_codes)}")
 
-st.caption(f"**{len(selected)} row(s) selected.**")
+st.caption(f"**{len(selected)} row(s) selected"
+           + (f" from {len(ups)} files." if multi else ".") + "**")
 
 # ---------------------------------------------------------------- step 3
 st.subheader("3 · Plants")
@@ -214,60 +240,121 @@ for p in chosen:
         needed.append(col)
 price_cols = needed + ["26-L10_USD"]
 
-st.caption("Type or paste the values from the price e-mail. "
-           "Only these columns matter — ignore L8HKSR, MS状态, 来源码 and 备注.")
+st.caption("From the price e-mail. Only these columns matter — ignore "
+           "L8HKSR, MS状态, 来源码 and 备注. "
+           "**L8 → Standard Price/MAP** (`MBEW-VERPR`) · "
+           "**26-L10_USD → L10 Cost** (`MBEW-ZPLP3`), same value for every plant.")
 
-base = pd.DataFrame({
-    "Material": codes,
-    "Description": [G.clean_str(r.get(G.SAP_DESC)) for r in selected],
-})
+descs = [G.clean_str(r.get(G.SAP_DESC)) for r in selected]
+base = pd.DataFrame({"Material": codes, "Description": descs})
 for c in price_cols:
     base[c] = pd.NA
 
-paste = st.text_area(
-    "Optional: paste rows copied from Excel (tab-separated). "
-    "First column must be the material code; the remaining numbers are matched "
-    "to the price columns below, in order.",
-    height=90, key="paste_box", placeholder="R0218071-00\t0.51\t0.59\t0.51")
+# Pre-fill from the source file's own price columns (confirmed 2026-10-15).
+# L10 Cost is currency-neutral so it always pre-fills. The L8 price only
+# pre-fills when every chosen plant shares ONE price column -- with US+CA the
+# source carries a single Standard Price/MAP that cannot be both, and silently
+# copying it into the CA column would ship a wrong price.
+prefilled = set()
+one_l8 = needed[0] if len(needed) == 1 else None
+for i, r in enumerate(selected):
+    v = r.get(G.SAP_L10_COST)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        base.at[i, "26-L10_USD"] = float(v)
+        prefilled.add(i)
+    if one_l8:
+        v = r.get(G.SAP_STD_PRICE)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            base.at[i, one_l8] = float(v)
+            prefilled.add(i)
 
-if st.button("Fill table from pasted text") and paste.strip():
+if prefilled:
+    msg = (f"Pre-filled {len(prefilled)} row(s) **from the source file's own "
+           "price columns**. Paste the e-mail prices over them — the e-mail "
+           "wins. Where the two disagree, check which is current.")
+    if one_l8 is None and len(needed) > 1:
+        msg += (f" Only L10 Cost was pre-filled: the source has a single "
+                f"Standard Price/MAP and this batch needs {len(needed)} "
+                "different L8 columns, so those are left blank on purpose.")
+    st.info(msg)
+
+paste = st.text_area(
+    "Paste rows copied from the price e-mail (tab-separated). First column is "
+    "the material code; the remaining numbers fill the price columns below, "
+    "in the order shown.",
+    height=90, key="paste_box",
+    placeholder="R0218124-00\t" + "\t".join(f"<{c}>" for c in price_cols))
+
+
+def parse_paste(text):
     parsed = {}
-    for line in paste.strip().splitlines():
-        parts = re.split(r"\t|\s{2,}|,", line.strip())
-        parts = [p.strip() for p in parts if p.strip()]
+    for line in text.strip().splitlines():
+        parts = [q.strip() for q in re.split(r"\t|\s{2,}|,", line.strip())
+                 if q.strip()]
         if not parts:
             continue
-        mat = parts[0]
         nums = []
-        for p in parts[1:]:
+        for q in parts[1:]:
             try:
-                nums.append(float(re.sub(r"[^\d.\-]", "", p)))
+                nums.append(float(re.sub(r"[^\d.\-]", "", q)))
             except ValueError:
                 pass
-        parsed[mat] = nums
-    for i, m in enumerate(base["Material"]):
-        nums = parsed.get(m)
-        if nums:
-            for j, c in enumerate(price_cols):
-                if j < len(nums):
-                    base.at[i, c] = nums[j]
-    st.session_state["price_df"] = base
-    st.success(f"Matched {sum(1 for m in base['Material'] if m in parsed)} "
-               f"of {len(base)} material codes.")
+        parsed[parts[0]] = nums
+    return parsed
 
+
+# Keep whatever is already in the editor, then apply a NEW paste on top.
+# Auto-applying on change (rather than behind a button) is deliberate: the
+# button was easy to miss and silently produced price-less files (2026-10-15).
 if "price_df" in st.session_state:
     prev = st.session_state["price_df"]
     if list(prev["Material"]) == list(base["Material"]) and \
        all(c in prev.columns for c in price_cols):
-        base = prev[["Material", "Description"] + price_cols]
+        base = prev[["Material", "Description"] + price_cols].copy()
+
+applied = st.session_state.get("paste_applied")
+if paste.strip() and paste != applied:
+    parsed = parse_paste(paste)
+    hit = 0
+    for i, m in enumerate(base["Material"]):
+        nums = parsed.get(m)
+        if not nums:
+            continue
+        hit += 1
+        for j, c in enumerate(price_cols):
+            if j < len(nums):
+                base.at[i, c] = nums[j]
+    st.session_state["paste_applied"] = paste
+    st.session_state["price_df"] = base
+    unmatched = sorted(set(parsed) - set(base["Material"]))
+    if hit:
+        st.success(f"Filled {hit} of {len(base)} materials from the pasted text."
+                   + (f" Not in this batch: {', '.join(unmatched)}"
+                      if unmatched else ""))
+    else:
+        st.warning("None of the pasted material codes match this batch. "
+                   f"Pasted: {', '.join(sorted(parsed)[:5])} … | "
+                   f"expected: {', '.join(sorted(set(base['Material']))[:5])}")
 
 edited = st.data_editor(
     base, use_container_width=True, hide_index=True, num_rows="fixed",
     disabled=["Material", "Description"],
-    column_config={c: st.column_config.NumberColumn(c, format="%.4f")
+    column_config={c: st.column_config.NumberColumn(c, format="%.2f")
                    for c in price_cols},
     key="price_editor")
 st.session_state["price_df"] = edited
+
+missing = []
+for _, r in edited.iterrows():
+    gaps = [c for c in price_cols if pd.isna(r.get(c))]
+    if gaps:
+        missing.append((str(r["Material"]), gaps))
+if missing:
+    st.error("Missing price(s) — SAP needs both, these rows would upload "
+             "blank:\n" + "\n".join(f"- **{m}** → {', '.join(g)}"
+                                     for m, g in missing))
+else:
+    st.success(f"All {len(edited)} material(s) have every price.")
 
 # ---------------------------------------------------------------- step 5
 st.subheader("5 · Generate")
@@ -287,7 +374,7 @@ if st.button("Generate files", type="primary"):
             out[m] = (std, l10)
         return out
 
-    results, all_warn, all_info = [], [], []
+    results, all_warn, all_info, price_warn = [], [], [], []
     try:
         for p, vk, is_copy in plan:
             if is_copy:
@@ -301,12 +388,13 @@ if st.button("Generate files", type="primary"):
                 w, i = G.scan_output(data, p)
                 all_warn += [(p, x) for x in w]
                 all_info += [(p, x) for x in i]
-                miss = G.check_missing_prices(selected, price_map(p))
-                for m, s, l in miss:
-                    all_warn.append((p, {"sap": "price", "header": "missing price",
-                                         "consensus": None,
-                                         "outliers": [(m, f"std={s} l10={l}")],
-                                         "col": "-"}))
+                for m, s, l in G.check_missing_prices(selected, price_map(p)):
+                    gaps = []
+                    if s is None:
+                        gaps.append("Standard Price/MAP")
+                    if l is None:
+                        gaps.append("L10 Cost")
+                    price_warn.append((p, m, " and ".join(gaps)))
             name = G.output_filename(out_date, p, vk, int(version))
             results.append((p, vk, is_copy, data, name))
     except Exception as e:  # noqa: BLE001
@@ -316,16 +404,28 @@ if st.button("Generate files", type="primary"):
     st.session_state["results"] = [(n, d) for (_p, _v, _c, d, n) in results]
     st.session_state["warn"] = all_warn
     st.session_state["info"] = all_info
+    st.session_state["price_warn"] = price_warn
 
 if "results" in st.session_state:
     warn = st.session_state.get("warn", [])
     info = st.session_state.get("info", [])
+    pwarn = st.session_state.get("price_warn", [])
+
+    if pwarn:
+        by_mat = {}
+        for p, m, gaps in pwarn:
+            by_mat.setdefault((m, gaps), []).append(p)
+        st.error("These materials have no price — SAP rejects a blank price, "
+                 "so fix them in step 4 and generate again:\n" +
+                 "\n".join(f"- **{m}** is missing {gaps} "
+                           f"({'/'.join(ps)})"
+                           for (m, gaps), ps in by_mat.items()))
 
     if warn:
-        st.error(f"{len(warn)} thing(s) to check before you upload to SAP:")
+        st.warning(f"{len(warn)} column(s) look odd — check before uploading:")
         for p, w in warn:
             kind = w.get("kind")
-            lead = f"- **{p}** · col {w['col']} · `{w['sap']}` ({w['header']})"
+            lead = f"- **{p}** · `{w['sap']}` ({w['header']}, col {w['col']})"
             if kind:
                 st.write(f"{lead} — **{kind}**: {w['outliers'][:5]}")
             else:
@@ -334,7 +434,8 @@ if "results" in st.session_state:
         st.caption("Each entry shows (Excel row in the output file, value). "
                    "Fix the source file and regenerate, or clear the cell by "
                    "hand after downloading.")
-    else:
+
+    if not warn and not pwarn:
         st.success("Contamination scan clean — no unexpected column varies "
                    "between rows, and every material has both prices.")
 
