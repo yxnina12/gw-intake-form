@@ -370,6 +370,17 @@ def prepare_row(src: dict, plant: str) -> dict:
     # and volume is derivable from L/W/H anyway.
     d[SAP_VOLUME] = None
 
+    # Float-noise guard on dimensions and weights. Some source files carry full
+    # binary precision (15.748031496062993" for what is really 40 cm) -- the
+    # user chose 2 decimals for those on 2026-10-13. But a genuine 3-decimal
+    # source value (69.703 cm in the 2026-10-08 EU batch) is real data and was
+    # delivered as-is, so only values with MORE than 3 decimals are rounded.
+    # Converted values are already round(x, 2), so this is a no-op for them.
+    for k in (SAP_LENGTH, SAP_WIDTH, SAP_HEIGHT, SAP_NET_WT, SAP_GROSS_WT):
+        v = d.get(k)
+        if isinstance(v, float) and round(v, 3) != v:
+            d[k] = round(v, 2)
+
     if d.get(SAP_HERKL):
         d[SAP_HERKL] = str(d[SAP_HERKL]).strip()[:2]
 
