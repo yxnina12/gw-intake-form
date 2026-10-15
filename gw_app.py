@@ -13,6 +13,95 @@ import streamlit as st
 
 import gw_core as G
 
+# Price-table paste parsing. The e-mail tables come straight out of Excel with
+# a header row, extra columns (国别 / 品名 / 来源码 / MS状态 / L8HKSR / 备注),
+# a column order that is not fixed, and often several header blocks separated
+# by blank rows. Matching on the header NAME rather than position handles all
+# of that; a headerless paste still falls back to positional order.
+PRICE_HEADER_ALIASES = {
+    "L8 US":       {"l8us", "l8-us", "l8_us", "l8us(usd)"},
+    "L8 CA (USD)": {"l8ca(usd)", "l8ca", "l8-ca", "l8_ca", "l8ca(us$)", "l8cad"},
+    "L8 EUR":      {"l8eur", "l8-eur", "l8_eur", "l8eur(eur)"},
+    "26-L10_USD":  {"26-l10_usd", "26l10usd", "26-l10usd", "26-l10", "l10(usd)",
+                    "l10usd", "l10", "l10_usd", "l10cost"},
+}
+MATERIAL_HEADER_ALIASES = {
+    "料件料号", "料号", "料件", "物料号", "物料编码", "物料",
+    "material", "materialcode", "materialno", "partno", "partnumber", "part#",
+}
+MAT_CODE_RE = re.compile(r"[A-Za-z]{1,3}\d{5,9}-\d{2}")
+
+
+def _norm_header(s):
+    s = str(s or "").replace("（", "(").replace("）", ")")
+    return re.sub(r"[\s\u3000]+", "", s).lower()
+
+
+def _num(s):
+    s = re.sub(r"[^\d.\-]", "", str(s or "").strip())
+    if s in ("", "-", ".", "-."):
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def parse_paste(text, price_cols):
+    """-> (rows {material: {column: value}}, columns_seen, used_header_mode)"""
+    rows, seen, header_mode = {}, set(), False
+    colmap, matcol = None, None
+    for raw in text.splitlines():
+        cells = raw.split("\t") if "\t" in raw else re.split(r"\s{2,}|,", raw)
+        cells = [c.strip() for c in cells]
+        if not any(cells):
+            continue
+        norm = [_norm_header(c) for c in cells]
+
+        hit_map, hit_mat = {}, None
+        for i, h in enumerate(norm):
+            if h in MATERIAL_HEADER_ALIASES:
+                hit_mat = i
+            for canon, al in PRICE_HEADER_ALIASES.items():
+                if h in al:
+                    hit_map[i] = canon
+        if hit_map:                        # a header row; may repeat mid-paste
+            colmap, matcol, header_mode = hit_map, hit_mat, True
+            seen |= set(hit_map.values())
+            continue
+
+        mat, mat_i = None, None
+        if matcol is not None and matcol < len(cells):
+            m = MAT_CODE_RE.search(cells[matcol])
+            if m:
+                mat, mat_i = m.group(0), matcol
+        if mat is None:
+            for i, c in enumerate(cells):
+                m = MAT_CODE_RE.search(c)
+                if m:
+                    mat, mat_i = m.group(0), i
+                    break
+        if mat is None:
+            continue
+
+        vals = {}
+        if colmap:
+            for i, canon in colmap.items():
+                if i < len(cells):
+                    v = _num(cells[i])
+                    if v is not None:
+                        vals[canon] = v
+        else:                              # headerless -> positional, as before
+            nums = [v for v in (_num(c) for c in cells[mat_i + 1:]) if v is not None]
+            for j, canon in enumerate(price_cols):
+                if j < len(nums):
+                    vals[canon] = nums[j]
+            seen |= set(vals)
+        if vals:
+            rows[mat] = vals
+    return rows, seen, header_mode
+
+
 TEMPLATE_NAME = "Material Intake Form-Spare Parts.xlsx"
 # The template can sit either next to app.py or in a templates/ subfolder —
 # whichever is easier to upload. First one found wins.
@@ -279,28 +368,15 @@ if prefilled:
     st.info(msg)
 
 paste = st.text_area(
-    "Paste rows copied from the price e-mail (tab-separated). First column is "
-    "the material code; the remaining numbers fill the price columns below, "
-    "in the order shown.",
-    height=90, key="paste_box",
-    placeholder="R0218124-00\t" + "\t".join(f"<{c}>" for c in price_cols))
-
-
-def parse_paste(text):
-    parsed = {}
-    for line in text.strip().splitlines():
-        parts = [q.strip() for q in re.split(r"\t|\s{2,}|,", line.strip())
-                 if q.strip()]
-        if not parts:
-            continue
-        nums = []
-        for q in parts[1:]:
-            try:
-                nums.append(float(re.sub(r"[^\d.\-]", "", q)))
-            except ValueError:
-                pass
-        parsed[parts[0]] = nums
-    return parsed
+    "Paste the price table straight out of the e-mail — **include the header "
+    "row**. Columns are matched by name, so the order does not matter and "
+    "国别 / 品名 / 来源码 / MS状态 / L8HKSR / 备注 are ignored. Repeated header "
+    "rows and blank separator rows are fine. Without a header row the numbers "
+    "are read in the column order shown below instead.",
+    height=140, key="paste_box",
+    placeholder="料件料号\tL8HKSR\t" + "\t".join(price_cols)
+                + "\nR0218302-00\t1.34\t"
+                + "\t".join("1.34" for _ in price_cols))
 
 
 # Keep whatever is already in the editor, then apply a NEW paste on top.
@@ -314,27 +390,39 @@ if "price_df" in st.session_state:
 
 applied = st.session_state.get("paste_applied")
 if paste.strip() and paste != applied:
-    parsed = parse_paste(paste)
+    parsed, seen_cols, header_mode = parse_paste(paste, price_cols)
     hit = 0
     for i, m in enumerate(base["Material"]):
-        nums = parsed.get(m)
-        if not nums:
+        vals = parsed.get(m)
+        if not vals:
             continue
         hit += 1
-        for j, c in enumerate(price_cols):
-            if j < len(nums):
-                base.at[i, c] = nums[j]
+        for c in price_cols:
+            if c in vals:
+                base.at[i, c] = vals[c]
     st.session_state["paste_applied"] = paste
     st.session_state["price_df"] = base
-    unmatched = sorted(set(parsed) - set(base["Material"]))
+
     if hit:
-        st.success(f"Filled {hit} of {len(base)} materials from the pasted text."
-                   + (f" Not in this batch: {', '.join(unmatched)}"
-                      if unmatched else ""))
+        how = ("matched by column header — order does not matter"
+               if header_mode else
+               "no header row found, so numbers were taken in column order")
+        note = f"Filled {hit} of {len(base)} materials ({how})."
+        absent = [c for c in price_cols if c not in seen_cols]
+        if absent:
+            note += (f" **{', '.join(absent)}** was not in the pasted table — "
+                     "type it in below, or paste a table that has it.")
+        extra = sorted(set(parsed) - set(base["Material"]))
+        if extra:
+            note += (f" {len(extra)} pasted code(s) are not in this batch and "
+                     f"were ignored: {', '.join(extra[:6])}"
+                     + (" …" if len(extra) > 6 else ""))
+        (st.warning if absent else st.success)(note)
     else:
-        st.warning("None of the pasted material codes match this batch. "
-                   f"Pasted: {', '.join(sorted(parsed)[:5])} … | "
-                   f"expected: {', '.join(sorted(set(base['Material']))[:5])}")
+        st.warning(
+            "No pasted material code matches this batch.\n\n"
+            f"- pasted: {', '.join(sorted(parsed)[:6]) or '(none recognised)'}\n"
+            f"- this batch needs: {', '.join(sorted(set(base['Material']))[:6])}")
 
 edited = st.data_editor(
     base, use_container_width=True, hide_index=True, num_rows="fixed",
