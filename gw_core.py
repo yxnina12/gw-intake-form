@@ -168,6 +168,35 @@ SAP_VKORG = "MVKE-VKORG"
 
 TEXT_FORMAT_SAP_FIELDS = {"MARM-EAN11", "MARC-STAWN"}
 
+# Per-material attribute columns. The template carries no fixed value for any
+# of them, so whatever the source says is written through verbatim and a plant
+# fixed value can never shadow them (rule confirmed by the user 2026-10-21).
+# Enforced in build_output, not just by the absence of a fixed value, so that
+# adding a plant default later cannot silently start overwriting them.
+SOURCE_ALWAYS_WINS = {
+    "MARA-ZMM_PRDTY",        # Product Type
+    "MARA-ZMM_EXTWG_ADD",    # Sub Category
+    "MARA-ZMM_EXTWG_ADD2",   # Attribute1
+    "MARA-ZMM_EXTWG_ADD3",   # Attribute2
+    "MARA-ZMM_DG_UNCODE",    # DG UN Code
+    "MARA-ZMM_SERIES",       # Series
+    "MARA-ZMM_SUB_BRAND",    # Sub-Brand
+    "MARA-ZMM_WARR_PERIODS", # Warr.Periods(Y)
+    "MARA-ZACDC",            # Power Type
+    "MARA-ZBRAND",           # Brand Type
+    "MARA-ZBATTERY",         # Battery Quantity
+    "MARA-ZCHARGER",         # Charger Quantity
+    "MARA-ZPRODUCT",         # Product Model Type
+    "MARA-ZPOWER",           # Norminal Power(WH)
+    "MARA-ZNOMINAL",         # Norminal Voltage(V)
+    "MARA-ZAMPERE",          # Amper Hour(AH)
+    "MARA-FERTH",            # 40 HC QTY
+    "MARA-NORMT",            # GW Model
+    "MARA-PROFL",            # DG indicator profile
+    "MARC-STAWN",            # Commodity Code
+    "MARC-HERKL",            # Cntry/Reg of Origin
+}
+
 # Flat-source (Sheet1) column header -> SAP code
 FLAT_FIELD_MAP = {
     "Material": SAP_MATNR,
@@ -191,6 +220,26 @@ FLAT_FIELD_MAP = {
     "DG UN Code": "MARA-ZMM_DG_UNCODE",
     "Commodity Code": "MARC-STAWN",
     "Cntry/Reg of Origin": SAP_HERKL,
+    # --- wider flat layout seen 2026-10-21 (43 columns). These header names
+    # match the template's own row-2 field names, so they map straight across.
+    # Mostly battery/charger/whole-goods attributes: blank on spare-parts rows,
+    # populated on powered items. Added with the user's confirmation.
+    "Brand": "MARA-LABOR",                       # confirmed 2026-10-21
+    "Product Type": "MARA-ZMM_PRDTY",
+    "Power Type": "MARA-ZACDC",
+    "Brand Type": "MARA-ZBRAND",
+    "Battery Quantity": "MARA-ZBATTERY",
+    "Charger Quantity": "MARA-ZCHARGER",
+    "Product Model Type": "MARA-ZPRODUCT",
+    "Norminal Power(WH)": "MARA-ZPOWER",
+    "Nominal Power(WH)": "MARA-ZPOWER",          # spelling variant
+    "Norminal Voltage(V)": "MARA-ZNOMINAL",
+    "Nominal Voltage(V)": "MARA-ZNOMINAL",       # spelling variant
+    "Amper Hour(AH)": "MARA-ZAMPERE",
+    "Amp Hour(AH)": "MARA-ZAMPERE",              # spelling variant
+    "DG indicator profile": "MARA-PROFL",
+    "DG profile": "MARA-PROFL",                  # spelling variant
+    "DG  profile": "MARA-PROFL",                 # template spells it with 2 spaces
 }
 
 
@@ -312,8 +361,15 @@ def read_flat_source(file_bytes: bytes):
             continue
         d = {}
         for header, sap in FLAT_FIELD_MAP.items():
+            d.setdefault(sap, None)
             i = col_idx.get(header)
-            d[sap] = values[i] if i is not None and i < len(values) else None
+            if i is None or i >= len(values):
+                continue
+            # several header spellings can map to one SAP code -- first
+            # non-empty wins, so an absent variant never blanks a found value
+            v = values[i]
+            if d.get(sap) is None and not (v is None or str(v).strip() == ""):
+                d[sap] = v
         d["_row"] = r
         d["_date"] = None
         rows.append(d)
@@ -429,6 +485,7 @@ def build_output(template_bytes: bytes, plant: str, src_rows: list,
     n_date = normalize_sap(SAP_L10_DATE)
     n_bismt = normalize_sap(SAP_BISMT)
     n_vkorg = normalize_sap(SAP_VKORG)
+    source_wins_n = {normalize_sap(c) for c in SOURCE_ALWAYS_WINS}
 
     for src in src_rows:
         row = prepare_row(src, plant)
@@ -442,6 +499,10 @@ def build_output(template_bytes: bytes, plant: str, src_rows: list,
             n = normalize_sap(sap)
             if n == n_vkorg and vkorg:
                 out[ci] = vkorg
+                continue
+            if n in source_wins_n:
+                v = row.get(sap)
+                out[ci] = None if (v is None or str(v).strip() == "") else v
                 continue
             if n in fixed:
                 out[ci] = fixed[n]
@@ -667,9 +728,24 @@ def strip_external_links(xlsx_bytes: bytes) -> bytes:
 # Output naming (skill Step 8)
 # ---------------------------------------------------------------------------
 
-def output_filename(out_date: date, plant: str, vkorg: str, version: int) -> str:
-    tab = PLANT_CONFIG[plant]["tab"]
-    return f"{out_date.month}.{out_date.day} {tab}-{vkorg}-{version}.xlsx"
+# Material-type tag in the file name. SP = Z002 spare parts, FG = Z001
+# finished goods, MIX = one file holding both.
+MATERIAL_TYPE_TAG = {"Z002": "SP", "Z001": "FG"}
+
+
+def output_filename(out_date: date, plant: str, vkorg: str, version: int,
+                    mtype: str = "SP") -> str:
+    """`<MM.DD> <plant>-<sales org>-<type>-<version>.xlsx` (scheme A, 2026-10-21).
+
+    Three things this fixes versus the old `<M.D> <tab>-<org>-<ver>` name:
+    the day is zero-padded so a folder sorts chronologically (10.8 used to
+    land after 10.21); the plant slot carries the real plant code rather than
+    the template tab name (the tabs are "US" for spare parts but "US30" for
+    finished goods, and "CA10" vs "CA"); and the material type is always
+    present instead of only on the non-default types.
+    """
+    return (f"{out_date.month:02d}.{out_date.day:02d} "
+            f"{plant}-{vkorg}-{mtype}-{version}.xlsx")
 
 
 def planned_outputs(plants: list):
